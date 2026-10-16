@@ -376,22 +376,6 @@ function trackRuntimeDataAccessed(
         )
         return
       }
-      if (currentStage >= RenderStage.NavigationStatic) {
-        // An access after `navigation()` resolves doesn't affect the shell or
-        // prefetch hints, because `navigation()` wouldn't have resolved in a
-        // runtime shell or prefetch either. We still mark it, so the client
-        // knows a link that needs the navigation stage should send a runtime
-        // request. It's marked in the stage where it happened, so if the
-        // client only reads up to the end of the prefetch stage, it won't
-        // see it.
-        markRuntimeDataAccessWhenStageReached(
-          prerenderDataTracking,
-          stagedRendering,
-          // We're already in this stage, so this marks it right away.
-          RenderStage.NavigationStatic
-        )
-        return
-      }
 
       const ensureStaticLevel =
         workUnitStore.ensureStaticLevel ?? EnsureStaticLevel.None
@@ -414,6 +398,7 @@ function trackRuntimeDataAccessed(
           let firstAffectedStage:
             | RenderStage.ShellStatic
             | RenderStage.PrefetchStatic
+            | RenderStage.NavigationStatic
             | null = null
 
           if (
@@ -437,6 +422,25 @@ function trackRuntimeDataAccessed(
             logRuntimeDeopt?.(expression, 'prefetch')
           }
 
+          // If the shell/prefetch stages are not affected, then:
+          // - we've skipped marking them due to `ensureStatic`, and should push the runtime
+          //   access to the navigation stage
+          // - or we've already finished those stages, and we're in the navigation stage now.
+          if (
+            firstAffectedStage === null &&
+            ensureStaticLevel < EnsureStaticLevel.Navigation
+          ) {
+            // An access after `navigation()` resolves doesn't affect the shell or
+            // prefetch hints, because `navigation()` wouldn't have resolved in a
+            // runtime shell or prefetch either. We still mark it, so the client
+            // knows a link that needs the navigation stage should send a runtime
+            // request. It's marked in the stage where it happened, so if the
+            // client only reads up to the end of the prefetch stage, it won't
+            // see it.
+            firstAffectedStage ??= RenderStage.NavigationStatic
+            logRuntimeDeopt?.(expression, 'navigation')
+          }
+
           if (firstAffectedStage !== null) {
             markRuntimeDataAccessWhenStageReached(
               prerenderDataTracking,
@@ -458,12 +462,30 @@ function trackRuntimeDataAccessed(
             // serve the fallback, the client knows it needs more. It waits for
             // the concrete prerender first, and only sends a runtime request
             // if that still needs runtime data, or if it gives up waiting.
-            if (ensureStaticLevel < EnsureStaticLevel.Prefetch) {
+
+            // `params` are URL data, so they are not included in shells, and can only affect
+            // the prefetch/navigation stages.
+            let firstAffectedStage:
+              | RenderStage.PrefetchStatic
+              | RenderStage.NavigationStatic
+              | null = null
+            switch (ensureStaticLevel) {
+              case EnsureStaticLevel.None:
+              case EnsureStaticLevel.Shell:
+                firstAffectedStage = RenderStage.PrefetchStatic
+                break
+              case EnsureStaticLevel.Prefetch:
+                firstAffectedStage = RenderStage.NavigationStatic
+                break
+              case EnsureStaticLevel.Navigation:
+                firstAffectedStage = null
+                break
+            }
+            if (firstAffectedStage !== null) {
               markRuntimeDataAccessWhenStageReached(
                 prerenderDataTracking,
                 stagedRendering,
-                // `params` are URL data, so they only affect the prefetch
-                RenderStage.PrefetchStatic
+                firstAffectedStage
               )
               logRuntimeUpgradeableFallback?.()
             }
@@ -473,18 +495,47 @@ function trackRuntimeDataAccessed(
           // intentional fallthrough
         }
         case PrerenderDataKind.UrlData: {
-          // Only deopt the prefetch, not the shell, which cannot access URL data anyway.
+          // Only deopt prefetch/navigation, not the shell, which cannot access URL data anyway.
+          let firstAffectedStage:
+            | RenderStage.PrefetchStatic
+            | RenderStage.NavigationStatic
+            | null = null
+
           if (
             currentStage <= RenderStage.PrefetchStatic &&
+            // Only track if we're not forcing the prefetch to be static.
             ensureStaticLevel < EnsureStaticLevel.Prefetch
           ) {
             prerenderDataTracking.shouldAttemptStaticPrefetch = false
+            firstAffectedStage ??= RenderStage.PrefetchStatic
             logRuntimeDeopt?.(expression, 'prefetch')
+          }
 
+          // If the shell/prefetch stages are not affected, then:
+          // - we've skipped marking them due to `ensureStatic`, and should push the runtime
+          //   access to the navigation stage
+          // - or we've already finished those stages, and we're in the navigation stage now.
+          if (
+            firstAffectedStage === null &&
+            // Only track if we're not forcing the navigation to be static.
+            ensureStaticLevel < EnsureStaticLevel.Navigation
+          ) {
+            // An access after `navigation()` resolves doesn't affect the shell or
+            // prefetch hints, because `navigation()` wouldn't have resolved in a
+            // runtime shell or prefetch either. We still mark it, so the client
+            // knows a link that needs the navigation stage should send a runtime
+            // request. It's marked in the stage where it happened, so if the
+            // client only reads up to the end of the prefetch stage, it won't
+            // see it.
+            firstAffectedStage ??= RenderStage.NavigationStatic
+            logRuntimeDeopt?.(expression, 'navigation')
+          }
+
+          if (firstAffectedStage !== null) {
             markRuntimeDataAccessWhenStageReached(
               prerenderDataTracking,
               stagedRendering,
-              RenderStage.PrefetchStatic
+              firstAffectedStage
             )
           }
           break
@@ -547,7 +598,7 @@ function markRuntimeDataAccessWhenStageReached(
 }
 
 const logRuntimeDeopt = process.env.NEXT_PRIVATE_DEBUG_RUNTIME_DATA
-  ? (expression: string, kind: 'shell' | 'prefetch') => {
+  ? (expression: string, kind: 'shell' | 'prefetch' | 'navigation') => {
       const { route } = workAsyncStorage.getStore()!
       console.log(
         `Route '${route}': deopting to a runtime ${kind} because it used ${expression}`
