@@ -1,11 +1,10 @@
-#[cfg(feature = "mmap")]
-use std::ops::Range;
 use std::{
     borrow::Cow,
     cmp::Ordering,
     hash::BuildHasherDefault,
     io,
     marker::PhantomData,
+    ops::Range,
     path::Path,
     rc::Rc,
     sync::{
@@ -318,9 +317,15 @@ impl StaticSortedFileMetaData {
     }
 }
 
+/// Both variants hold the decoded block-offset table, read once at open. Every block access needs
+/// two of its entries; keeping them in process memory means locating a block never reads the
+/// table's file pages. It costs 4 bytes per block.
 enum StaticSortedFileBacking {
     #[cfg(feature = "mmap")]
-    Mmap(Arc<Mmap>),
+    Mmap {
+        mmap: Arc<Mmap>,
+        block_offsets: Arc<[u32]>,
+    },
     File {
         file: Arc<File>,
         file_len: usize,
@@ -426,7 +431,7 @@ impl IndexBlock {
         let entries = match backing {
             // Store a range, not the slice: `StaticSortedFile` owns the mmap these bytes live in.
             #[cfg(feature = "mmap")]
-            StaticSortedFileBacking::Mmap(mmap) => {
+            StaticSortedFileBacking::Mmap { mmap, .. } => {
                 let start = entry_bytes.as_ptr() as usize - mmap.as_ptr() as usize;
                 IndexEntries::Mmap(start..start + entry_bytes.len())
             }
@@ -442,8 +447,8 @@ impl IndexBlock {
 impl StaticSortedFile {
     /// Opens an SST file using the configured access mode.
     ///
-    /// Only the index block is read here, and its CRC is verified. Key and value blocks stay
-    /// lazy, read on demand.
+    /// The block-offset table is read and decoded here, and the index block is read and
+    /// CRC-verified. Key and value blocks stay lazy, read on demand.
     pub fn open(
         db_path: &Path,
         meta: StaticSortedFileMetaData,
@@ -471,20 +476,16 @@ impl StaticSortedFile {
                         mmap.advise_range(memmap2::Advice::Sequential, offset, mmap.len() - offset);
                 }
                 advise_mmap_for_persistence(&mmap)?;
-                StaticSortedFileBacking::Mmap(Arc::new(mmap))
+                let block_offsets =
+                    decode_block_offsets(&mmap[meta.block_offsets_start(mmap.len())..]).into();
+                StaticSortedFileBacking::Mmap {
+                    mmap: Arc::new(mmap),
+                    block_offsets,
+                }
             }
             AccessMode::File => {
                 let file_len: usize = file.metadata()?.len().try_into()?;
-                let offset = meta.block_offsets_start(file_len);
-                let mut bytes = vec![0; file_len - offset];
-                pread(file.file(), &mut bytes, offset as u64)?;
-                let block_offsets = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|bytes| be::read_u32(bytes))
-                    .collect::<Vec<_>>()
-                    .into();
+                let block_offsets = read_block_offsets(file.file(), &meta, file_len)?.into();
                 StaticSortedFileBacking::File {
                     file: Arc::new(file),
                     file_len,
@@ -513,7 +514,7 @@ impl StaticSortedFile {
     fn index_entries(&self) -> &[[u8; INDEX_BLOCK_ENTRY_SIZE]] {
         let bytes = match (&self.index.entries, &self.backing) {
             #[cfg(feature = "mmap")]
-            (IndexEntries::Mmap(range), StaticSortedFileBacking::Mmap(mmap)) => {
+            (IndexEntries::Mmap(range), StaticSortedFileBacking::Mmap { mmap, .. }) => {
                 &mmap[range.clone()]
             }
             (IndexEntries::Owned(bytes), _) => &bytes[..],
@@ -785,7 +786,7 @@ impl BlockRef<'_> {
         match self {
             #[cfg(feature = "mmap")]
             BlockRef::Mmap(data) => {
-                let StaticSortedFileBacking::Mmap(mmap) = backing else {
+                let StaticSortedFileBacking::Mmap { mmap, .. } = backing else {
                     // `get_or_read_block` only borrows from an mmap backing.
                     unreachable!("mmap-borrowed block with a file backing")
                 };
@@ -819,9 +820,13 @@ fn get_or_read_block<'l>(
     #[cfg(not(feature = "mmap"))]
     let _ = verified_blocks;
     #[cfg(feature = "mmap")]
-    let mmap_block = if let StaticSortedFileBacking::Mmap(mmap) = backing {
+    let mmap_block = if let StaticSortedFileBacking::Mmap {
+        mmap,
+        block_offsets,
+    } = backing
+    {
         let (uncompressed_length, checksum, block_data) =
-            get_raw_block_slice(mmap, meta, block_index).with_context(|| {
+            get_raw_block_slice(mmap, block_offsets, meta, block_index).with_context(|| {
                 format!(
                     "Failed to read raw block {} from {:08}.sst",
                     block_index, meta.sequence_number
@@ -859,7 +864,7 @@ fn get_or_read_block<'l>(
                 // benefits from the bitmap to skip redundant CRC verification.
                 match backing {
                     #[cfg(feature = "mmap")]
-                    StaticSortedFileBacking::Mmap(_) => verify_checksum_once(
+                    StaticSortedFileBacking::Mmap { .. } => verify_checksum_once(
                         meta,
                         &block_data,
                         checksum,
@@ -891,64 +896,87 @@ fn get_or_read_block<'l>(
     ))
 }
 
-/// Gets the raw block slice directly from a memory-mapped file.
-/// Returns `(uncompressed_length, checksum, block_data)`.
-#[cfg(feature = "mmap")]
-fn get_raw_block_slice<'a>(
-    mmap: &'a Mmap,
+/// Decodes an SST's block-offset table: the trailing `4 * block_count` bytes, one big-endian `u32`
+/// end offset per block.
+fn decode_block_offsets(table: &[u8]) -> Vec<u32> {
+    table
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| be::read_u32(bytes))
+        .collect()
+}
+
+/// Reads and decodes an SST's block-offset table with a positional read.
+fn read_block_offsets(
+    file: &std::fs::File,
     meta: &StaticSortedFileMetaData,
+    file_len: usize,
+) -> Result<Vec<u32>> {
+    let offset = meta.block_offsets_start(file_len);
+    let mut bytes = vec![0; file_len - offset];
+    pread(file, &mut bytes, offset as u64)?;
+    Ok(decode_block_offsets(&bytes))
+}
+
+/// Returns the byte range of block `block_index`, header included, from the decoded block-offset
+/// table.
+fn block_range(
+    meta: &StaticSortedFileMetaData,
+    block_offsets: &[u32],
+    file_len: usize,
     block_index: u16,
-) -> Result<(u32, u32, &'a [u8])> {
+) -> Result<Range<usize>> {
+    let index = block_index as usize;
     #[cfg(feature = "strict_checks")]
-    if block_index >= meta.block_count {
-        bail!(
-            "Corrupted file seq:{} block:{} > number of blocks {} (block_offsets: {:x})",
-            meta.sequence_number,
-            block_index,
-            meta.block_count,
-            meta.block_offsets_start(mmap.len()),
-        );
-    }
-    let offset = meta.block_offsets_start(mmap.len()) + block_index as usize * 4;
-    #[cfg(feature = "strict_checks")]
-    if offset + 4 > mmap.len() {
-        bail!(
-            "Corrupted file seq:{} block:{} block offset locations {} + 4 bytes > file end {} \
-             (block_offsets: {:x})",
-            meta.sequence_number,
-            block_index,
-            offset,
-            mmap.len(),
-            meta.block_offsets_start(mmap.len()),
-        );
-    }
-    let block_start = if block_index == 0 {
+    ensure!(
+        index < block_offsets.len(),
+        "Corrupted file seq:{} block:{} >= number of blocks {}",
+        meta.sequence_number,
+        block_index,
+        block_offsets.len()
+    );
+    let block_start = if index == 0 {
         0
     } else {
-        be::read_u32(&mmap[offset - 4..]) as usize
+        block_offsets[index - 1] as usize
     };
-    let block_end = be::read_u32(&mmap[offset..]) as usize;
+    let block_end = block_offsets[index] as usize;
     #[cfg(feature = "strict_checks")]
-    if block_end > mmap.len() || block_start > mmap.len() {
-        bail!(
-            "Corrupted file seq:{} block:{} block {} - {} > file end {} (block_offsets: {:x})",
-            meta.sequence_number,
-            block_index,
-            block_start,
-            block_end,
-            mmap.len(),
-            meta.block_offsets_start(mmap.len()),
-        );
-    }
     ensure!(
-        block_start + BLOCK_HEADER_SIZE <= block_end,
+        block_end <= file_len,
+        "Corrupted file seq:{} block:{} block end {} > file end {}",
+        meta.sequence_number,
+        block_index,
+        block_end,
+        file_len
+    );
+    let _ = file_len;
+    ensure!(
+        block_end
+            .checked_sub(block_start)
+            .is_some_and(|len| len >= BLOCK_HEADER_SIZE),
         "block {} header truncated in {:08}.sst",
         block_index,
         meta.sequence_number
     );
-    let uncompressed_length = be::read_u32(&mmap[block_start..]);
-    let checksum = be::read_u32(&mmap[block_start + 4..]);
-    let block = &mmap[block_start + BLOCK_HEADER_SIZE..block_end];
+    Ok(block_start..block_end)
+}
+
+/// Gets the raw block slice directly from a memory-mapped file, locating it through the decoded
+/// `block_offsets` table.
+/// Returns `(uncompressed_length, checksum, block_data)`.
+#[cfg(feature = "mmap")]
+fn get_raw_block_slice<'a>(
+    mmap: &'a Mmap,
+    block_offsets: &[u32],
+    meta: &StaticSortedFileMetaData,
+    block_index: u16,
+) -> Result<(u32, u32, &'a [u8])> {
+    let range = block_range(meta, block_offsets, mmap.len(), block_index)?;
+    let uncompressed_length = be::read_u32(&mmap[range.start..]);
+    let checksum = be::read_u32(&mmap[range.start + 4..]);
+    let block = &mmap[range.start + BLOCK_HEADER_SIZE..range.end];
     Ok((uncompressed_length, checksum, block))
 }
 
@@ -960,9 +988,12 @@ fn get_raw_block<'a>(
 ) -> Result<(u32, u32, Cow<'a, [u8]>)> {
     match backing {
         #[cfg(feature = "mmap")]
-        StaticSortedFileBacking::Mmap(mmap) => {
+        StaticSortedFileBacking::Mmap {
+            mmap,
+            block_offsets,
+        } => {
             let (uncompressed_length, checksum, block) =
-                get_raw_block_slice(mmap, meta, block_index)?;
+                get_raw_block_slice(mmap, block_offsets, meta, block_index)?;
             Ok((uncompressed_length, checksum, Cow::Borrowed(block)))
         }
         StaticSortedFileBacking::File {
@@ -970,26 +1001,9 @@ fn get_raw_block<'a>(
             file_len,
             block_offsets,
         } => {
-            let index = block_index as usize;
-            #[cfg(feature = "strict_checks")]
-            ensure!(index < block_offsets.len(), "block index out of bounds");
-            let block_start = if index == 0 {
-                0
-            } else {
-                block_offsets[index - 1] as usize
-            };
-            let block_end = block_offsets[index] as usize;
-            #[cfg(feature = "strict_checks")]
-            ensure!(block_end <= *file_len, "block end out of bounds");
-            let _ = file_len;
-            ensure!(
-                block_start + BLOCK_HEADER_SIZE <= block_end,
-                "block {} header truncated in {:08}.sst",
-                block_index,
-                meta.sequence_number
-            );
-            let mut bytes = vec![0; block_end - block_start];
-            pread(file.file(), &mut bytes, block_start as u64)?;
+            let range = block_range(meta, block_offsets, *file_len, block_index)?;
+            let mut bytes = vec![0; range.len()];
+            pread(file.file(), &mut bytes, range.start as u64)?;
             let uncompressed_length = be::read_u32(&bytes);
             let checksum = be::read_u32(&bytes[4..]);
             let block = bytes.split_off(BLOCK_HEADER_SIZE);
@@ -1084,7 +1098,7 @@ fn read_block_lookup(
     if uncompressed_length == 0 {
         return match (backing, block) {
             #[cfg(feature = "mmap")]
-            (StaticSortedFileBacking::Mmap(mmap), Cow::Borrowed(block)) => {
+            (StaticSortedFileBacking::Mmap { mmap, .. }, Cow::Borrowed(block)) => {
                 // SAFETY: block points into mmap.
                 Ok(unsafe { ArcBytes::from_mmap(mmap, block) })
             }
@@ -1108,9 +1122,12 @@ fn get_raw_block_iter(
 ) -> Result<(u32, u32, RcBytes)> {
     match backing {
         #[cfg(feature = "mmap")]
-        StaticSortedFileIterBacking::Mmap(mmap) => {
+        StaticSortedFileIterBacking::Mmap {
+            mmap,
+            block_offsets,
+        } => {
             let (uncompressed_length, checksum, block) =
-                get_raw_block_slice(mmap, meta, block_index)?;
+                get_raw_block_slice(mmap, block_offsets, meta, block_index)?;
             // SAFETY: block points into mmap.
             Ok((uncompressed_length, checksum, unsafe {
                 RcBytes::from_mmap(mmap, block)
@@ -1121,26 +1138,9 @@ fn get_raw_block_iter(
             file_len,
             block_offsets,
         } => {
-            let index = block_index as usize;
-            #[cfg(feature = "strict_checks")]
-            ensure!(index < block_offsets.len(), "block index out of bounds");
-            let block_start = if index == 0 {
-                0
-            } else {
-                block_offsets[index - 1] as usize
-            };
-            let block_end = block_offsets[index] as usize;
-            #[cfg(feature = "strict_checks")]
-            ensure!(block_end <= *file_len, "block end out of bounds");
-            let _ = file_len;
-            ensure!(
-                block_start + BLOCK_HEADER_SIZE <= block_end,
-                "block {} header truncated in {:08}.sst",
-                block_index,
-                meta.sequence_number
-            );
-            let mut bytes = vec![0; block_end - block_start];
-            pread(file.file(), &mut bytes, block_start as u64)?;
+            let range = block_range(meta, block_offsets, *file_len, block_index)?;
+            let mut bytes = vec![0; range.len()];
+            pread(file.file(), &mut bytes, range.start as u64)?;
             let uncompressed_length = be::read_u32(&bytes);
             let checksum = be::read_u32(&bytes[4..]);
             let block = bytes.split_off(BLOCK_HEADER_SIZE);
@@ -1214,9 +1214,13 @@ fn handle_key_match_generic<B: SharedBytes>(
     })
 }
 
+/// Like [`StaticSortedFileBacking`], both variants hold the decoded block-offset table.
 enum StaticSortedFileIterBacking {
     #[cfg(feature = "mmap")]
-    Mmap(Rc<Mmap>),
+    Mmap {
+        mmap: Rc<Mmap>,
+        block_offsets: Rc<[u32]>,
+    },
     File {
         file: Rc<File>,
         file_len: usize,
@@ -1334,20 +1338,16 @@ impl StaticSortedFileIter {
                 #[cfg(unix)]
                 mmap.advise(memmap2::Advice::Sequential)?;
                 advise_mmap_for_persistence(&mmap)?;
-                StaticSortedFileIterBacking::Mmap(Rc::new(mmap))
+                let block_offsets =
+                    decode_block_offsets(&mmap[meta.block_offsets_start(mmap.len())..]).into();
+                StaticSortedFileIterBacking::Mmap {
+                    mmap: Rc::new(mmap),
+                    block_offsets,
+                }
             }
             AccessMode::File => {
                 let file_len: usize = file.metadata()?.len().try_into()?;
-                let offset = meta.block_offsets_start(file_len);
-                let mut bytes = vec![0; file_len - offset];
-                pread(file.file(), &mut bytes, offset as u64)?;
-                let block_offsets = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|bytes| be::read_u32(bytes))
-                    .collect::<Vec<_>>()
-                    .into();
+                let block_offsets = read_block_offsets(file.file(), &meta, file_len)?.into();
                 StaticSortedFileIterBacking::File {
                     file: Rc::new(file),
                     file_len,
@@ -1829,6 +1829,46 @@ fn get_fixed_key_entry<'l>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_meta(block_count: u16) -> StaticSortedFileMetaData {
+        StaticSortedFileMetaData {
+            sequence_number: 7,
+            block_count,
+        }
+    }
+
+    #[test]
+    fn decodes_big_endian_block_offsets() {
+        assert_eq!(
+            decode_block_offsets(&[0, 0, 0, 12, 0, 0, 1, 0]),
+            vec![12, 256]
+        );
+    }
+
+    #[test]
+    fn block_range_uses_previous_end_as_start() -> Result<()> {
+        let meta = test_meta(3);
+        let offsets = [12, 30, 48];
+        assert_eq!(block_range(&meta, &offsets, 60, 0)?, 0..12);
+        assert_eq!(block_range(&meta, &offsets, 60, 1)?, 12..30);
+        assert_eq!(block_range(&meta, &offsets, 60, 2)?, 30..48);
+        Ok(())
+    }
+
+    #[test]
+    fn block_range_rejects_truncated_or_reversed_blocks() {
+        let meta = test_meta(3);
+        assert!(block_range(&meta, &[7, 20, 40], 60, 0).is_err());
+        assert!(block_range(&meta, &[20, 10, 40], 60, 1).is_err());
+    }
+
+    #[cfg(feature = "strict_checks")]
+    #[test]
+    fn block_range_strict_checks_index_and_file_end() {
+        let meta = test_meta(2);
+        assert!(block_range(&meta, &[12, 30], 60, 2).is_err());
+        assert!(block_range(&meta, &[12, 61], 60, 1).is_err());
+    }
 
     /// `block_type` and `from_block_type` must be inverses over every layout and both entry
     /// sizings. This is what lets the writer and the readers agree: the writer picks a variant and

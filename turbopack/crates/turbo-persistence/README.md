@@ -396,7 +396,9 @@ Bottom merges are paced by the fresh (not yet compacted) files of the family: th
 - Read the `CURRENT` file
 - Delete all files with a higher sequence number than the one in the `CURRENT` file.
 - Read all `*.del` files and delete the files that are listed in there.
-- Read all `*.sst` files and memory map them.
+- Read all `*.sst` files and memory map them. Each SST's block-offset table (4 bytes per block) is
+  decoded into memory when the file is opened, so locating a block does not read the table's mapped
+  pages.
 
 ## Closing
 
